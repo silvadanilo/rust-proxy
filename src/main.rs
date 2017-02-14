@@ -18,7 +18,7 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
-use std::io::{Read, Write, ErrorKind, Error};
+use std::io::{Read, Write, ErrorKind};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::{io, str};
@@ -78,27 +78,63 @@ impl ConnectedClients {
     }
 }
 
-fn get_connection(handle: &Handle) -> Box<Future<Item = (), Error = io::Error>> {
+fn get_connection(handle: &Handle, connToServer: ConnectedClients) -> Box<Future<Item = (), Error = io::Error>> {
     let remote_addr = "127.0.0.1:9876".parse().unwrap();
     let tcp = TcpStream::connect(&remote_addr, handle);
 
-    let client = tcp.and_then(|stream| {
-        let (sink, from_server) = stream.framed(LineCodec).split();
-        let reader = from_server.for_each(|message| {
+    let handle_clone = handle.clone();
+    let i: u32 = 0;
+
+    let connToServer_clone = connToServer.clone();
+
+    let client = tcp.and_then(move |stream| {
+        let (tx, rx) = mpsc::channel(8);
+        connToServer_clone.insert(i, Client::new(tx));
+
+        let (sender, receiver) = stream.framed(LineCodec).split();
+        let reader = receiver.for_each(|message| {
             println!("{}", message);
+            Ok(())
+        })
+        .map(|_| -> Result<(), ()> {
+            Ok(())
+        })
+        .map_err(|_| -> Result<(), ()> {
             Ok(())
         });
 
-        reader.map(|_| {
-            println!("CLIENT DISCONNECTED");
-            ()
-        })
+        // let writer = rx.forward(sender)
+        //     .map(|_| ())
+        //     .map_err(|_| io::Error::new(io::ErrorKind::Other, "fail to forward"));
+
+        let writer = rx
+            .map_err(|()| unreachable!("rx can't fail"))
+            .fold(sender, |sender, msg| {
+                sender.send(msg).map_err(|_| ())
+            })
+            .map(|_| -> Result<(), ()> {
+                Ok(())
+            })
+            .map_err(|_| -> Result<(), ()> {
+                Ok(())
+            });
+        ;
+
+        reader.select(writer)
+            .map(|_| {
+                println!("CLIENT DISCONNECTED");
+                ()
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "client disconnected")
+            })
     });
 
-    let client = client.or_else(|_| {
-        println!("connection refuse");
-        Ok(())
-    });
+    let client = client
+        .or_else(|_| {
+            println!("connection refuse");
+            Ok(())
+        });
 
     Box::new(client)
 }
@@ -106,16 +142,65 @@ fn get_connection(handle: &Handle) -> Box<Future<Item = (), Error = io::Error>> 
 fn main() {
     env_logger::init().unwrap();
 
+    let clients = ConnectedClients::new();
+
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     let handle_clone = handle.clone();
+    let clients_clone = clients.clone();
     let client = future::loop_fn((), move |_| {
         // Run the get_connection function and loop again regardless of its result
-        get_connection(&handle_clone)
+        get_connection(&handle_clone, clients_clone.clone())
             .map(|_| -> Loop<(), ()> {
                 Loop::Continue(())
             })
     });
 
-    core.run(client).unwrap();
+    let client = client.map_err(|_| panic!()); // errors not possible on rx
+    handle.spawn(client);
+    // core.run(client).unwrap();
+
+
+    let address = "0.0.0.0:12345".parse().unwrap();
+    let listener = TcpListener::bind(&address, &core.handle()).unwrap();
+    let connections = listener.incoming();
+
+    let (tx, rx) = mpsc::unbounded();
+    // let rx = rx.map_err(|_| panic!()); // errors not possible on rx
+
+    let clients_clone = clients.clone();
+    let sync = rx.for_each(move |msg| {
+        clients_clone.broadcast(msg)
+    });
+    handle.spawn(sync);
+
+
+
+    let server = connections.for_each(|(socket, _)| {
+        // Use the `Io::framed` helper to get a transport from a socket. The
+        // `LineCodec` handles encoding / decoding frames.
+        let transport = socket.framed(LineCodec);
+
+        // The transport is a `Stream<Item = String>`. So we can now operate at
+        // at the frame level. For each received line, write the string to
+        // STDOUT.
+        //
+        // The return value of `for_each` is a future that completes once
+        // `transport` is done yielding new lines. This happens when the
+        // underlying socket closes.
+        // let process_connection = transport.for_each(move |line| {
+        let nonhocapitoperchedevoclonarlo = tx.clone();
+        let process_connection = transport.for_each(move |line| {
+            nonhocapitoperchedevoclonarlo.clone().send(line)
+                .map_err(|err| io::Error::new(ErrorKind::Other, err))
+                .map(|_| ())
+        });
+
+        // Spawn a new task dedicated to processing the connection
+        handle.spawn(process_connection.map_err(|_| ()));
+
+        Ok(())
+    });
+
+    core.run(server).unwrap();
 }
