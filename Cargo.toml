@@ -4,10 +4,10 @@ version = "0.1.0"
 authors = ["root"]
 
 [dependencies]
-futures = "0.1"
-tokio-core = "0.1"
-tokio-service = "0.1"
-tokio-proto = "0.1"
+futures = "~0.1.10"
+tokio-core = "~0.1"
+tokio-service = "~0.1"
+tokio-proto = "~0.1"
 tokio-line = {git="https://github.com/tokio-rs/tokio-line"}
 log = "*"
 env_logger = "*"
