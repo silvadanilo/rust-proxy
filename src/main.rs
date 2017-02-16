@@ -78,12 +78,15 @@ impl ConnectedClients {
     }
 }
 
-fn get_connection(handle: &Handle, connToServer: ConnectedClients) -> Box<Future<Item = (), Error = io::Error>> {
+fn get_connection(
+    handle: &Handle,
+    connToServer: ConnectedClients
+) -> Box<Future<Item = (), Error = io::Error>> {
     let remote_addr = "127.0.0.1:9876".parse().unwrap();
     let tcp = TcpStream::connect(&remote_addr, handle);
 
     let handle_clone = handle.clone();
-    let i: u32 = 0;
+    let mut i: u32 = 0; // i is always zero and in my case it's ok because I want to overwrite the last one
 
     let connToServer_clone = connToServer.clone();
 
@@ -107,6 +110,7 @@ fn get_connection(handle: &Handle, connToServer: ConnectedClients) -> Box<Future
         //     .map(|_| ())
         //     .map_err(|_| io::Error::new(io::ErrorKind::Other, "fail to forward"));
 
+    let connToServer_clone = connToServer.clone();
         let writer = rx
             .map_err(|()| unreachable!("rx can't fail"))
             .fold(sender, |sender, msg| {
@@ -115,7 +119,7 @@ fn get_connection(handle: &Handle, connToServer: ConnectedClients) -> Box<Future
             .map(|_| -> Result<(), ()> {
                 Ok(())
             })
-            .map_err(|_| -> Result<(), ()> {
+            .map_err(move |_| -> Result<(), ()> {
                 Ok(())
             });
         ;
@@ -134,15 +138,84 @@ fn get_connection(handle: &Handle, connToServer: ConnectedClients) -> Box<Future
         .or_else(|_| {
             println!("connection refuse");
             Ok(())
+            // Err(io::Error::new(io::ErrorKind::Other, "connection refuse"))
         });
 
     Box::new(client)
 }
 
+#[derive(Clone)]
+struct Buffer {
+    remote_server_is_ready: bool,
+    remote_tx: Option<mpsc::Sender<String>>,
+}
+
+impl Buffer {
+    fn ready(&mut self) {
+        self.remote_server_is_ready = true;
+    }
+}
+
+use futures::{AsyncSink, StartSend, Poll};
+use futures::sync::mpsc::{SendError};
+
+impl Sink for Buffer {
+    type SinkItem = String;
+    type SinkError = SendError<()>;
+
+    fn start_send(&mut self, msg: String) -> StartSend<String, SendError<()>> {
+        if !self.remote_server_is_ready {
+            println!("not ready");
+            return Ok(AsyncSink::NotReady(msg));
+        }
+
+        println!("{}", msg);
+
+        Ok(AsyncSink::Ready)
+    }
+
+    fn poll_complete(&mut self) -> Poll<(), SendError<()>> {
+        println!("complete");
+        Ok(Async::Ready(()))
+    }
+}
+
+use tokio_core::reactor::Timeout;
+use std::time::Duration;
+use futures::IntoFuture;
+
 fn main() {
     env_logger::init().unwrap();
 
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
+
+    let mut buffer = Buffer {
+        remote_server_is_ready: false,
+        remote_tx: None,
+    };
+    let buffer_cloned = buffer.clone();
+
+    let t = Timeout::new(Duration::new(5, 0), &handle).into_future().flatten();
+    let f = t.and_then(move |_| {
+        println!("TIMEOUT");
+        buffer.ready();
+        Ok(())
+    });
+
+    let f = f.map_err(|_| panic!());
+    handle.spawn(f);
+
+    let s = buffer_cloned.send("prova".to_string());
+
+    core.run(s).unwrap();
+
+    return;
+
+
     let clients = ConnectedClients::new();
+    let (tx, rx) = mpsc::unbounded();
+    // let rx = rx.map_err(|_| panic!()); // errors not possible on rx
 
     let mut core = Core::new().unwrap();
     let handle = core.handle();
@@ -154,9 +227,12 @@ fn main() {
             .map(|_| -> Loop<(), ()> {
                 Loop::Continue(())
             })
+            // .map_err(|_| -> Loop<(), ()> { //unuseful :(
+            //     Loop::Continue(())
+            // })
     });
 
-    let client = client.map_err(|_| panic!()); // errors not possible on rx
+    let client = client.map_err(|_| panic!());
     handle.spawn(client);
     // core.run(client).unwrap();
 
@@ -165,16 +241,11 @@ fn main() {
     let listener = TcpListener::bind(&address, &core.handle()).unwrap();
     let connections = listener.incoming();
 
-    let (tx, rx) = mpsc::unbounded();
-    // let rx = rx.map_err(|_| panic!()); // errors not possible on rx
-
     let clients_clone = clients.clone();
     let sync = rx.for_each(move |msg| {
         clients_clone.broadcast(msg)
     });
     handle.spawn(sync);
-
-
 
     let server = connections.for_each(|(socket, _)| {
         // Use the `Io::framed` helper to get a transport from a socket. The
